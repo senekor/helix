@@ -1,15 +1,18 @@
 use std::fmt::Write;
 use std::io::BufReader;
 use std::ops::{self, Deref};
+use std::sync::Arc;
 
 use crate::job::Job;
 
 use super::*;
 
+use arc_swap::ArcSwap;
 use helix_core::command_line::{Args, Flag, Signature, Token, TokenKind};
 use helix_core::fuzzy::fuzzy_match;
 use helix_core::indent::MAX_INDENT;
 use helix_core::line_ending;
+use helix_lsp::ExpandedMacro;
 use helix_stdx::path::home_dir;
 use helix_view::document::{read_to_string, DEFAULT_LANGUAGE_NAME};
 use helix_view::editor::{CloseError, ConfigEvent};
@@ -4108,7 +4111,15 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: exclude_workspace,
         completer: CommandCompleter::none(),
         signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
-    }
+    },
+    TypableCommand {
+        name: "expand-macro",
+        aliases: &[],
+        doc: "Expand Rust macro recursively",
+        fun: expand_macro,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
+    },
 ];
 
 pub static TYPABLE_COMMAND_MAP: LazyLock<HashMap<&'static str, &'static TypableCommand>> =
@@ -4604,5 +4615,57 @@ fn exclude_workspace(
     let workspace = current_workspace(cx);
     cx.editor.workspace_trust.exclude(&workspace);
     cx.editor.config_events.0.send(ConfigEvent::Refresh)?;
+    Ok(())
+}
+
+fn expand_macro(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let (view, doc) = current!(cx.editor);
+    let feature = LanguageServerFeature::ExpandMacro;
+    let language_server = doc.language_servers_with_feature(feature).next();
+    let language_server = match language_server {
+        Some(language_server) => language_server,
+        None => anyhow::bail!("No configured language server supports {}", feature),
+    };
+    let offset_encoding = language_server.offset_encoding();
+    let pos = doc.position(view.id, offset_encoding);
+    let doc_identifier = doc.identifier();
+    let response = language_server.expand_macro(doc_identifier, pos).unwrap();
+    let callback = async move {
+        let ExpandedMacro { expansion, name } = response.await.context("failed to expand macro")?;
+        let title = format!("Recursive expansion of {name} macro");
+        let underline = "=".repeat(title.len());
+        let header = format!("// {title}\n// {underline}");
+        let call: job::Callback = job::Callback::Editor(Box::new(move |editor: &mut Editor| {
+            let doc = Document::from(
+                helix_core::Rope::from(format!("{header}\n\n{expansion}\n")),
+                None,
+                editor.config.clone(),
+                Arc::new(ArcSwap::from_pointee(helix_core::syntax::Loader::default())),
+            );
+            let id = editor.new_file_from_document(Action::Replace, doc);
+            if let Some(doc) = editor.documents.get_mut(&id) {
+                let loader = editor.syn_loader.load();
+                let _ = doc.set_language_by_language_id("rust", &loader);
+                doc.detect_indent_and_line_ending();
+            }
+            editor.refresh_language_servers(id);
+            if let Some(doc) = editor.documents.get_mut(&id) {
+                let diagnostics =
+                    Editor::doc_diagnostics(&editor.language_servers, &editor.diagnostics, doc);
+                doc.replace_diagnostics(diagnostics, &[], None);
+            }
+        }));
+        Ok(call)
+    };
+
+    cx.jobs.callback(callback);
     Ok(())
 }

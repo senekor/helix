@@ -4,6 +4,7 @@ use crate::{
     transport::{Payload, Transport},
     Call, Error, LanguageServerId, OffsetEncoding, Result,
 };
+use helix_lsp_types::request::Request;
 use log::info;
 
 use crate::lsp::{
@@ -19,7 +20,7 @@ use helix_core::{
 use helix_loader::VERSION_AND_GIT_HASH;
 use helix_stdx::path;
 use parking_lot::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, path::PathBuf};
 use std::{
@@ -70,6 +71,12 @@ pub struct Client {
     shutdown_flushed: Arc<Notify>,
     /// workspace folders added while the server is still initializing
     req_timeout: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ExpandedMacro {
+    pub expansion: String,
+    pub name: String,
 }
 
 impl Client {
@@ -407,6 +414,7 @@ impl Client {
                         | CallHierarchyServerCapability::Options(_)
                 )
             ),
+            LanguageServerFeature::ExpandMacro => self.name == "rust-analyzer",
         }
     }
 
@@ -1786,6 +1794,33 @@ impl Client {
         };
 
         Some(self.call::<lsp::request::Rename>(params))
+    }
+
+    pub fn expand_macro(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        position: lsp::Position,
+    ) -> Option<impl Future<Output = Result<ExpandedMacro>>> {
+        struct ExpandMacro;
+
+        #[derive(Serialize, Deserialize)]
+        #[allow(non_snake_case)]
+        struct ExpandMacroParams {
+            textDocument: lsp::TextDocumentIdentifier,
+            position: lsp::Position,
+        }
+
+        impl Request for ExpandMacro {
+            type Params = ExpandMacroParams;
+            type Result = ExpandedMacro;
+            const METHOD: &'static str = "rust-analyzer/expandMacro";
+        }
+
+        let params = ExpandMacroParams {
+            textDocument: text_document,
+            position,
+        };
+        Some(self.call::<ExpandMacro>(params))
     }
 
     pub fn command(
